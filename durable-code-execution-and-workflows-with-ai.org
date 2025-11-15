@@ -443,6 +443,348 @@ flowchart TB
 
 5. *Long-lived agents*: Transform ephemeral LLM calls into stateful, resilient processes
 
+* Demo: Camel Visual Tracking Implementation
+
+This section demonstrates how the theoretical concepts are implemented in a real Quarkus + Apache Camel application with SQLite persistence.
+
+** Entity Relationship Model
+
+#+BEGIN_SRC mermaid
+erDiagram
+    ExchangeState ||--o{ ExchangeCheckpoint : "has many"
+    ExchangeState ||--o| ApprovalRequest : "may have"
+    ExchangeState }o--|| RouteMetric : "aggregates to"
+    ExchangeState ||--o{ RouteLog : "generates"
+
+    ExchangeState {
+        string exchangeId PK
+        string routeId
+        enum status
+        int currentStep
+        string currentStepName
+        text payload
+        text context
+        datetime createdAt
+        datetime startedAt
+        datetime completedAt
+        datetime lastCheckpoint
+    }
+
+    ExchangeCheckpoint {
+        long id PK
+        string exchangeId FK
+        int stepIndex
+        string stepName
+        text stepData
+        datetime timestamp
+    }
+
+    ApprovalRequest {
+        string id PK
+        string exchangeId FK
+        string routeId
+        text payload
+        string status
+        datetime createdAt
+        datetime completedAt
+    }
+
+    RouteMetric {
+        string routeId PK
+        string status
+        long totalCount
+        long successCount
+        long failureCount
+        datetime lastUpdated
+    }
+
+    RouteLog {
+        long id PK
+        string routeId
+        string exchangeId
+        string eventType
+        text message
+        datetime timestamp
+    }
+#+END_SRC
+
+** Core Entities Explained
+
+*** ExchangeState - The Durable Execution Heart
+
+This entity embodies the "persisted checkpoint" concept. It tracks:
+
+#+BEGIN_SRC kotlin
+@Entity
+@Table(name = "exchange_state")
+class ExchangeState(
+    @Id
+    var exchangeId: String,           // Unique workflow instance ID
+    var routeId: String,              // Which workflow type
+    var status: ExchangeStatus,       // Current lifecycle state
+    var currentStep: Int,             // Position in ordered flow
+    var currentStepName: String?,     // Human-readable step identifier
+    var payload: String,              // Serialized input/output data
+    var context: String?,             // Headers, properties (JSON)
+    var lastCheckpoint: LocalDateTime // Recovery timestamp
+)
+
+enum class ExchangeStatus {
+    PENDING,          // Created, waiting to start
+    RUNNING,          // Currently processing
+    PAUSED,           // User paused execution
+    WAITING_APPROVAL, // Blocked at human approval gate
+    CANCELLED,        // User cancelled
+    COMPLETED,        // Successfully finished
+    FAILED            // Error occurred
+}
+#+END_SRC
+
+*Key Features:*
+- *Payload persistence*: Full execution context survives crashes
+- *Position tracking*: =currentStep= and =currentStepName= enable exact recovery point
+- *Status machine*: Maps directly to the durable agent lifecycle diagram
+- *Recovery queries*: =findRunning()= supports crash recovery scenarios
+
+*** ExchangeCheckpoint - Step-by-Step Audit Trail
+
+Implements fine-grained checkpointing with idempotency:
+
+#+BEGIN_SRC kotlin
+@Entity
+@Table(name = "exchange_checkpoints")
+class ExchangeCheckpoint(
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    var id: Long?,
+    var exchangeId: String,    // Links to parent exchange
+    var stepIndex: Int,        // Ordered step number
+    var stepName: String,      // Step identifier
+    var stepData: String?,     // Step-specific context (JSON)
+    var timestamp: LocalDateTime
+) {
+    companion object {
+        // Idempotency check prevents duplicate checkpoints
+        fun logCheckpoint(exchangeId: String, stepIndex: Int,
+                          stepName: String, stepData: String?): Boolean {
+            val exists = count("exchangeId = ?1 AND stepName = ?2",
+                               exchangeId, stepName) > 0
+            if (exists) return false  // Idempotent skip
+            ExchangeCheckpoint(...).persist()
+            return true
+        }
+    }
+}
+#+END_SRC
+
+*Key Features:*
+- *Idempotent operations*: Safe to replay without duplicates
+- *Granular history*: Every step recorded with timestamp
+- *Recovery support*: =getLatestCheckpoint()= finds exact resume point
+- *Audit trail*: Complete execution history for debugging
+
+*** ApprovalRequest - Human-in-the-Loop Gate
+
+Implements workflow pausing for human decisions:
+
+#+BEGIN_SRC kotlin
+@Entity
+@Table(name = "approval_requests")
+class ApprovalRequest(
+    @Id
+    var id: String = UUID.randomUUID().toString(),
+    var exchangeId: String,    // Blocked workflow instance
+    var routeId: String,       // Workflow type
+    var payload: String,       // Data requiring approval
+    var status: String,        // PENDING, APPROVED, REJECTED
+    var createdAt: LocalDateTime,
+    var completedAt: LocalDateTime?
+)
+#+END_SRC
+
+*Key Features:*
+- *Non-blocking persistence*: Workflow waits indefinitely without resource consumption
+- *Decision audit*: Approval/rejection timestamped and tracked
+- *Resume capability*: Approved requests trigger workflow continuation
+
+*** RouteMetric - Aggregate Observability
+
+Tracks workflow-level statistics:
+
+#+BEGIN_SRC kotlin
+@Entity
+@Table(name = "route_metrics")
+class RouteMetric(
+    @Id
+    var routeId: String,
+    var status: String,
+    var totalCount: Long,
+    var successCount: Long,
+    var failureCount: Long,
+    var lastUpdated: LocalDateTime
+)
+#+END_SRC
+
+*Key Features:*
+- *Health monitoring*: Success/failure ratios per workflow type
+- *Dashboard support*: Aggregate statistics for UI visualization
+- *Trend analysis*: Track workflow performance over time
+
+*** RouteLog - Event Audit Trail
+
+Provides detailed event logging:
+
+#+BEGIN_SRC kotlin
+@Entity
+@Table(name = "route_logs")
+class RouteLog(
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    var id: Long?,
+    var routeId: String,
+    var exchangeId: String,
+    var eventType: String,     // STARTED, COMPLETED, FAILED, etc.
+    var message: String?,      // Human-readable details
+    var timestamp: LocalDateTime
+)
+#+END_SRC
+
+*Key Features:*
+- *Debugging support*: Detailed event history for troubleshooting
+- *Observability*: Complements the "Agent History" concept
+- *Filtering*: Query by route, exchange, or event type
+
+** How Entities Map to Concepts
+
+#+BEGIN_SRC mermaid
+flowchart TB
+    subgraph Concepts["Theoretical Concepts"]
+        C1[Durable Execution]
+        C2[Checkpointing]
+        C3[Human-in-the-Loop]
+        C4[Observability]
+        C5[Recovery]
+    end
+
+    subgraph Entities["Hibernate Entities"]
+        E1[ExchangeState]
+        E2[ExchangeCheckpoint]
+        E3[ApprovalRequest]
+        E4[RouteMetric]
+        E5[RouteLog]
+    end
+
+    C1 --> E1
+    C2 --> E2
+    C3 --> E3
+    C4 --> E4
+    C4 --> E5
+    C5 --> E1
+    C5 --> E2
+
+    style Concepts fill:#e8f5e9
+    style Entities fill:#e3f2fd
+#+END_SRC
+
+** Workflow Lifecycle with Entities
+
+#+BEGIN_SRC mermaid
+sequenceDiagram
+    participant User
+    participant API
+    participant Camel as Camel Route
+    participant ES as ExchangeState
+    participant EC as ExchangeCheckpoint
+    participant AR as ApprovalRequest
+    participant RL as RouteLog
+
+    User->>API: Submit workflow
+    API->>ES: Create (PENDING)
+    API->>RL: Log "CREATED"
+
+    Camel->>ES: Update (RUNNING)
+    Camel->>EC: Checkpoint Step 1
+    Camel->>RL: Log "STEP_COMPLETED"
+
+    Camel->>EC: Checkpoint Step 2
+    Camel->>RL: Log "STEP_COMPLETED"
+
+    Note over Camel: Reaches approval gate
+    Camel->>ES: Update (WAITING_APPROVAL)
+    Camel->>AR: Create (PENDING)
+    Camel->>RL: Log "WAITING_APPROVAL"
+
+    User->>API: Approve request
+    API->>AR: Update (APPROVED)
+    API->>ES: Update (RUNNING)
+    API->>RL: Log "RESUMED"
+
+    Camel->>EC: Checkpoint Step 3
+    Camel->>ES: Update (COMPLETED)
+    Camel->>RL: Log "COMPLETED"
+#+END_SRC
+
+** Crash Recovery Flow
+
+#+BEGIN_SRC mermaid
+flowchart TB
+    subgraph BeforeCrash["Before Crash"]
+        B1[Exchange RUNNING]
+        B2[Checkpoint at Step 2]
+        B3[Processing Step 3]
+    end
+
+    subgraph Crash["System Crash"]
+        C1[Process Terminates]
+    end
+
+    subgraph Recovery["After Restart"]
+        R1[Query: findRunning]
+        R2[Load ExchangeState]
+        R3[Load Latest Checkpoint]
+        R4[Resume from Step 3]
+    end
+
+    subgraph Database["SQLite Database"]
+        DB1[(ExchangeState<br/>status: RUNNING<br/>currentStep: 2)]
+        DB2[(Checkpoints<br/>Step 1 ✓<br/>Step 2 ✓)]
+    end
+
+    B1 --> B2 --> B3
+    B3 --> C1
+    C1 --> R1
+
+    R1 --> DB1
+    DB1 --> R2
+    R2 --> R3
+    R3 --> DB2
+    DB2 --> R4
+
+    style Crash fill:#ffcdd2
+    style Recovery fill:#c8e6c9
+    style Database fill:#e3f2fd
+#+END_SRC
+
+** Technology Stack
+
+| Layer           | Technology              | Purpose                                    |
+|-----------------+-------------------------+--------------------------------------------|
+| Framework       | Quarkus 3.x             | Kubernetes-native, fast startup            |
+| ORM             | Hibernate Panache       | Active Record pattern for Kotlin           |
+| Database        | SQLite with WAL mode    | Lightweight, ACID-compliant persistence    |
+| Integration     | Apache Camel 4.x        | Workflow orchestration and routing         |
+| Language        | Kotlin                  | Concise, null-safe JVM language            |
+| Serialization   | Kotlinx Serialization   | JSON for payload and context fields        |
+
+** Code Location
+
+#+BEGIN_SRC text
+src/main/kotlin/com/outcastgeek/ubntth/entities/
+├── ExchangeState.kt       # Core durable execution state
+├── ExchangeCheckpoint.kt  # Step-by-step checkpoints
+├── ApprovalRequest.kt     # Human-in-the-loop gates
+├── RouteMetric.kt         # Aggregate metrics
+└── RouteLog.kt            # Event audit trail
+#+END_SRC
+
 * References
 
 ** Durable Execution Frameworks
