@@ -443,6 +443,278 @@ flowchart TB
 
 5. *Long-lived agents*: Transform ephemeral LLM calls into stateful, resilient processes
 
+* Apache Camel: The Integration Backbone
+
+** What is Apache Camel?
+
+Apache Camel is an open-source integration framework that implements Enterprise Integration Patterns (EIPs). It provides a rule-based routing and mediation engine that allows you to define routing rules in various domain-specific languages (DSLs).
+
+*** Core Concepts
+
+| Concept        | Description                                                     |
+|----------------+-----------------------------------------------------------------|
+| Route          | A sequence of processing steps for messages                     |
+| Exchange       | The message container carrying data through the route           |
+| Processor      | A unit of work that transforms or processes the exchange        |
+| Component      | Connectors to external systems (HTTP, JMS, Kafka, etc.)         |
+| EIP            | Enterprise Integration Patterns (routing, splitting, etc.)      |
+
+** Why Apache Camel for Durable Workflows?
+
+*** Built-in Patterns for Workflow Construction
+
+#+BEGIN_SRC mermaid
+flowchart LR
+    subgraph CamelPatterns["Camel EIPs for Workflows"]
+        P1[Content-Based Router]
+        P2[Splitter]
+        P3[Aggregator]
+        P4[Dead Letter Channel]
+        P5[Wire Tap]
+        P6[Throttler]
+    end
+
+    subgraph WorkflowNeeds["Workflow Requirements"]
+        W1[Conditional Branching]
+        W2[Parallel Processing]
+        W3[Result Aggregation]
+        W4[Error Handling]
+        W5[Audit Logging]
+        W6[Rate Limiting]
+    end
+
+    P1 --> W1
+    P2 --> W2
+    P3 --> W3
+    P4 --> W4
+    P5 --> W5
+    P6 --> W6
+
+    style CamelPatterns fill:#fff3e0
+    style WorkflowNeeds fill:#e8f5e9
+#+END_SRC
+
+*** Camel Route as Workflow Definition
+
+#+BEGIN_SRC kotlin
+// Example: Durable workflow with checkpointing
+from("direct:process-order")
+    .routeId("order-processing")
+    .process { exchange ->
+        // Checkpoint: Order received
+        checkpointManager.save(exchange, "ORDER_RECEIVED")
+    }
+    .to("bean:validateOrder")
+    .process { exchange ->
+        // Checkpoint: Order validated
+        checkpointManager.save(exchange, "ORDER_VALIDATED")
+    }
+    .choice()
+        .when(header("requiresApproval").isEqualTo(true))
+            .to("direct:human-approval-gate")
+        .otherwise()
+            .to("direct:auto-approve")
+    .end()
+    .process { exchange ->
+        // Checkpoint: Order approved
+        checkpointManager.save(exchange, "ORDER_APPROVED")
+    }
+    .to("bean:fulfillOrder")
+    .process { exchange ->
+        // Checkpoint: Order fulfilled
+        checkpointManager.save(exchange, "ORDER_FULFILLED")
+    }
+#+END_SRC
+
+** Camel + Persistence = Durable Execution
+
+*** The Missing Piece
+
+Apache Camel provides excellent workflow orchestration but lacks built-in durable execution. By combining Camel with persistence layers, we achieve:
+
+#+BEGIN_SRC mermaid
+flowchart TB
+    subgraph CamelLayer["Apache Camel (Orchestration)"]
+        C1[Route Definition]
+        C2[Message Routing]
+        C3[Error Handling]
+        C4[EIP Patterns]
+    end
+
+    subgraph PersistenceLayer["Persistence Layer (Durability)"]
+        P1[Exchange State Storage]
+        P2[Checkpoint Recording]
+        P3[Approval Queue]
+        P4[Event History]
+    end
+
+    subgraph Combined["Durable Workflow Engine"]
+        D1[Fault-Tolerant Execution]
+        D2[Human-in-the-Loop]
+        D3[Crash Recovery]
+        D4[Audit Trail]
+    end
+
+    CamelLayer --> Combined
+    PersistenceLayer --> Combined
+
+    C1 -.->|"Defines Flow"| D1
+    C3 -.->|"Handles Failures"| D1
+    P1 -.->|"Survives Crashes"| D3
+    P2 -.->|"Enables Resume"| D3
+    P3 -.->|"Pauses for Humans"| D2
+    P4 -.->|"Tracks Everything"| D4
+
+    style CamelLayer fill:#fff3e0
+    style PersistenceLayer fill:#e3f2fd
+    style Combined fill:#e8f5e9
+#+END_SRC
+
+*** Key Integration Points
+
+1. *Exchange Interceptors*
+   - Capture exchange state before/after each processor
+   - Persist to database for recovery
+
+2. *Custom Processors*
+   - Inject checkpoint logic at strategic points
+   - Implement idempotent operations
+
+3. *Error Handlers*
+   - Persist failure state before retry
+   - Enable resume from last successful step
+
+4. *Route Policies*
+   - Control execution flow
+   - Implement approval gates
+
+** Camel Architecture for Durable AI Workflows
+
+#+BEGIN_SRC mermaid
+flowchart TB
+    subgraph EntryPoints["Entry Points"]
+        E1[REST API]
+        E2[Timer/Scheduler]
+        E3[Message Queue]
+        E4[File System]
+    end
+
+    subgraph CamelRoutes["Camel Routes (Deterministic Layer)"]
+        R1[Data Validation Route]
+        R2[AI Processing Route]
+        R3[Approval Gate Route]
+        R4[Result Processing Route]
+    end
+
+    subgraph AIActivities["AI Activities (Non-Deterministic)"]
+        A1[LLM Summarization]
+        A2[Classification]
+        A3[Entity Extraction]
+    end
+
+    subgraph Persistence["Durable Storage"]
+        DB1[(Exchange State)]
+        DB2[(Checkpoints)]
+        DB3[(AI Responses Cache)]
+    end
+
+    E1 --> R1
+    E2 --> R1
+    E3 --> R1
+    E4 --> R1
+
+    R1 --> R2
+    R2 --> R3
+    R3 --> R4
+
+    R2 -.->|"Invoke"| A1
+    R2 -.->|"Invoke"| A2
+    R2 -.->|"Invoke"| A3
+
+    A1 -->|"Cache Response"| DB3
+    A2 -->|"Cache Response"| DB3
+    A3 -->|"Cache Response"| DB3
+
+    R1 -->|"Checkpoint"| DB2
+    R2 -->|"Checkpoint"| DB2
+    R3 -->|"Checkpoint"| DB2
+    R4 -->|"Checkpoint"| DB2
+
+    R1 -->|"Update State"| DB1
+    R2 -->|"Update State"| DB1
+    R3 -->|"Update State"| DB1
+    R4 -->|"Update State"| DB1
+
+    DB3 -.->|"Replay without Re-querying LLM"| R2
+
+    style CamelRoutes fill:#e8f5e9
+    style AIActivities fill:#fff8e1
+    style Persistence fill:#e3f2fd
+#+END_SRC
+
+** Camel DSL Features for Workflows
+
+*** Route Control
+
+#+BEGIN_SRC kotlin
+// Pause execution for approval
+from("direct:approval-gate")
+    .setProperty("APPROVAL_REQUIRED", constant(true))
+    .process { exchange ->
+        // Persist approval request
+        approvalService.createRequest(exchange)
+        // Update state to WAITING_APPROVAL
+        stateService.updateStatus(exchange, WAITING_APPROVAL)
+    }
+    // Route stops here until approval is granted
+    // External trigger resumes execution
+
+// Resume from checkpoint
+from("direct:resume-exchange")
+    .process { exchange ->
+        val checkpoint = checkpointService.getLatest(exchange.exchangeId)
+        // Restore exchange state from checkpoint
+        exchange.properties.putAll(checkpoint.context)
+    }
+    .toD("direct:${header('RESUME_STEP')}")
+#+END_SRC
+
+*** Error Handling with Persistence
+
+#+BEGIN_SRC kotlin
+onException(Exception::class.java)
+    .maximumRedeliveries(3)
+    .redeliveryDelay(1000)
+    .onRedelivery { exchange ->
+        // Log retry attempt
+        routeLogService.logEvent(
+            exchange.routeId,
+            exchange.exchangeId,
+            "RETRY_ATTEMPT",
+            "Attempt ${exchange.properties["CamelRedeliveryCounter"]}"
+        )
+    }
+    .process { exchange ->
+        // On final failure, persist failed state
+        stateService.updateStatus(exchange, FAILED)
+        checkpointService.save(exchange, "FAILED")
+    }
+    .to("direct:dead-letter-queue")
+#+END_SRC
+
+** Benefits of Camel for Durable Workflows
+
+| Benefit                    | Description                                                |
+|----------------------------+------------------------------------------------------------|
+| Declarative Routing        | Define complex workflows in readable DSL                   |
+| 300+ Components            | Connect to virtually any system out-of-the-box             |
+| EIP Implementation         | Battle-tested enterprise patterns                          |
+| Type Safety (Kotlin DSL)   | Compile-time checks for route definitions                  |
+| Testability                | Mock endpoints for unit testing routes                     |
+| Observability              | Built-in metrics and tracing support                       |
+| Lightweight                | Runs in any JVM environment (no external coordinator)      |
+| Quarkus Integration        | Native compilation, fast startup, low memory footprint     |
+
 * Demo: Camel Visual Tracking Implementation
 
 This section demonstrates how the theoretical concepts are implemented in a real Quarkus + Apache Camel application with SQLite persistence.
@@ -796,6 +1068,13 @@ src/main/kotlin/com/outcastgeek/ubntth/entities/
 - LangGraph Persistence System: https://deepwiki.com/langchain-ai/langgraph/4-persistence-system
 - Pydantic AI + Temporal: https://temporal.io/blog/build-durable-ai-agents-pydantic-ai-and-temporal
 - Microsoft Durable Multi-Agent Orchestration: https://techcommunity.microsoft.com/blog/appsonazureblog/building-durable-and-deterministic-multi-agent-orchestrations-with-durable-execu/4408842
+
+** Apache Camel
+- Apache Camel Official Documentation: https://camel.apache.org/manual/
+- Enterprise Integration Patterns: https://camel.apache.org/components/4.x/eips/enterprise-integration-patterns.html
+- Camel Quarkus Extension: https://camel.apache.org/camel-quarkus/latest/
+- Camel Kotlin DSL: https://camel.apache.org/manual/kotlin-dsl.html
+- Camel Error Handling: https://camel.apache.org/manual/error-handling-in-camel.html
 
 ** Additional Resources
 - Temporal Learn Tutorials: https://learn.temporal.io/tutorials/
