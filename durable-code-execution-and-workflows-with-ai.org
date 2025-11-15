@@ -1,0 +1,461 @@
+#+TITLE: Durable Code Execution and Workflows with AI
+#+AUTHOR:
+#+OPTIONS: toc:3
+
+* Introduction
+
+Durable execution bridges the gap between predictable workflows and unpredictable AI behavior. This document explores the architectural patterns needed to make AI agent executions reliable, recoverable, and production-ready.
+
+* The Core Dilemmas
+
+** Deterministic vs Non-Deterministic Execution
+
+*** The Problem
+
+| Aspect          | Workflows                              | AI Agents                                    |
+|-----------------+----------------------------------------+----------------------------------------------|
+| Execution Path  | Predefined order                       | Runtime decisions                            |
+| Predictability  | Known outcomes                         | Unknown until LLM responds                   |
+| Components      | Steps + Flow + Conditions + Retries    | Tool calls, MCPs, Function calling           |
+| Recovery        | Replay exact same path                 | May take different path on restart           |
+
+*** Visual Representation
+
+#+BEGIN_SRC mermaid
+flowchart LR
+    subgraph Deterministic["Deterministic Workflow"]
+        direction TB
+        W1[Step 1] --> W2[Step 2]
+        W2 --> W3{Condition}
+        W3 -->|Yes| W4[Step 3A]
+        W3 -->|No| W5[Step 3B]
+        W4 --> W6[Step 4]
+        W5 --> W6
+    end
+
+    subgraph NonDeterministic["Non-Deterministic AI Agent"]
+        direction TB
+        A1[Goal] --> A2{LLM Decision}
+        A2 -->|Tool A| A3[Execute Tool A]
+        A2 -->|Tool B| A4[Execute Tool B]
+        A2 -->|Tool C| A5[Execute Tool C]
+        A3 --> A6{Next Decision}
+        A4 --> A6
+        A5 --> A6
+        A6 -->|???| A7[Unknown Path]
+    end
+
+    Deterministic -.->|"Known at Design Time"| Result1[Predictable]
+    NonDeterministic -.->|"Known at Runtime"| Result2[Unpredictable]
+#+END_SRC
+
+** AI Agent History vs Persisted Checkpoints
+
+*** Distinction
+
+- *AI Agent History*: Traces agent actions for observability and debugging
+- *Persisted Checkpoints*: Captures actual work state for recovery and resumption
+
+*** The Relationship
+
+#+BEGIN_SRC mermaid
+flowchart TB
+    subgraph AgentHistory["Agent History (Observability)"]
+        H1[Action 1: Called LLM]
+        H2[Action 2: Selected Tool X]
+        H3[Action 3: Executed Tool X]
+        H4[Action 4: Called LLM again]
+        H1 --> H2 --> H3 --> H4
+    end
+
+    subgraph Checkpoints["Persisted Checkpoints (Durability)"]
+        C1[Checkpoint 1<br/>State: Initial<br/>Context: Input Data]
+        C2[Checkpoint 2<br/>State: After Tool X<br/>Context: Tool Result + Position]
+        C3[Checkpoint 3<br/>State: Completed<br/>Context: Final Output]
+    end
+
+    AgentHistory -->|"Different Purpose"| Checkpoints
+
+    H3 -.->|"Triggers"| C2
+
+    style AgentHistory fill:#e1f5fe
+    style Checkpoints fill:#fff3e0
+#+END_SRC
+
+* What Makes Execution Durable
+
+** Core Requirements
+
+1. *Checkpoints at Every Step*
+   - Work and tasks must have checkpoints
+   - Not just "task completed" but complete state snapshots
+
+2. *Rich Checkpoint Content*
+   - Progress indicators
+   - Execution context
+   - Position in ordered flow
+   - Input/output data
+
+3. *Persistent Storage*
+   - Start to finish persistence
+   - All intermediate steps included
+   - Survives process crashes
+
+** Checkpoint Architecture
+
+#+BEGIN_SRC mermaid
+flowchart TB
+    subgraph Execution["Workflow Execution"]
+        E1[Task 1] --> E2[Task 2] --> E3[Task 3] --> E4[Task 4]
+    end
+
+    subgraph Storage["Durable Storage"]
+        S1[(Checkpoint 1)]
+        S2[(Checkpoint 2)]
+        S3[(Checkpoint 3)]
+        S4[(Checkpoint 4)]
+    end
+
+    E1 -->|"Save State"| S1
+    E2 -->|"Save State"| S2
+    E3 -->|"Save State"| S3
+    E4 -->|"Save State"| S4
+
+    subgraph Recovery["Fault Recovery"]
+        R1[Crash at Task 3]
+        R2[Load Checkpoint 2]
+        R3[Resume from Task 3]
+    end
+
+    S2 -.->|"On Failure"| R2
+    R2 --> R3
+
+    style Storage fill:#c8e6c9
+    style Recovery fill:#ffcdd2
+#+END_SRC
+
+** Checkpoint Data Model
+
+#+BEGIN_SRC mermaid
+classDiagram
+    class Checkpoint {
+        +String id
+        +String workflowId
+        +int stepNumber
+        +DateTime timestamp
+        +ExecutionState state
+        +Map context
+        +byte[] serializedData
+        +String parentCheckpointId
+    }
+
+    class ExecutionState {
+        <<enumeration>>
+        PENDING
+        RUNNING
+        PAUSED
+        WAITING_APPROVAL
+        COMPLETED
+        FAILED
+        CANCELLED
+    }
+
+    class WorkflowExecution {
+        +String id
+        +String workflowType
+        +DateTime startTime
+        +DateTime endTime
+        +List~Checkpoint~ checkpoints
+        +Checkpoint currentCheckpoint
+    }
+
+    Checkpoint --> ExecutionState
+    WorkflowExecution --> Checkpoint : has many
+#+END_SRC
+
+* Making AI Agents Durable
+
+** Requirements for Durable AI Agents
+
+1. *Long-Lived Processes*
+   - Not ephemeral request handlers
+   - Maintain state across interactions
+   - Survive restarts and failures
+
+2. *Continuous Work Polling*
+   - Check for new work on schedule or in loop
+   - React to events and triggers
+   - Handle backpressure gracefully
+
+3. *Work-in-Progress Tracking*
+   - Know what tasks are active
+   - Resume incomplete work after restart
+   - Prevent duplicate execution
+
+** Durable Agent Lifecycle
+
+#+BEGIN_SRC mermaid
+stateDiagram-v2
+    [*] --> Initializing
+    Initializing --> Polling : Agent Started
+
+    Polling --> Processing : Work Available
+    Polling --> Polling : No Work (Wait)
+
+    Processing --> Checkpointing : Step Completed
+    Checkpointing --> Processing : More Steps
+    Checkpointing --> Polling : Work Complete
+
+    Processing --> Recovering : Failure Detected
+    Recovering --> Checkpointing : Load Last Checkpoint
+
+    Processing --> WaitingApproval : Human Gate
+    WaitingApproval --> Processing : Approved
+    WaitingApproval --> Cancelled : Rejected
+
+    Polling --> Shutdown : Graceful Stop
+    Cancelled --> Polling
+    Shutdown --> [*]
+#+END_SRC
+
+** Separation of Concerns Pattern
+
+#+BEGIN_SRC mermaid
+flowchart TB
+    subgraph DeterministicLayer["Deterministic Workflow Layer"]
+        WF1[Workflow Orchestrator]
+        WF2[Step Sequencer]
+        WF3[Retry Logic]
+        WF4[Checkpoint Manager]
+    end
+
+    subgraph NonDeterministicLayer["Non-Deterministic Activity Layer"]
+        ACT1[LLM Call Activity]
+        ACT2[Tool Execution Activity]
+        ACT3[External API Activity]
+    end
+
+    subgraph PersistenceLayer["Persistence Layer"]
+        DB1[(Event History)]
+        DB2[(Checkpoints)]
+        DB3[(Agent State)]
+    end
+
+    WF1 --> WF2
+    WF2 --> WF3
+    WF3 --> WF4
+
+    WF2 -.->|"Invoke"| ACT1
+    WF2 -.->|"Invoke"| ACT2
+    WF2 -.->|"Invoke"| ACT3
+
+    ACT1 -->|"Result Persisted"| DB1
+    ACT2 -->|"Result Persisted"| DB1
+    ACT3 -->|"Result Persisted"| DB1
+
+    WF4 -->|"Save"| DB2
+    WF1 -->|"Track"| DB3
+
+    DB1 -.->|"Replay on Recovery"| WF2
+
+    style DeterministicLayer fill:#e8f5e9
+    style NonDeterministicLayer fill:#fff8e1
+    style PersistenceLayer fill:#e3f2fd
+#+END_SRC
+
+* Important Remarks
+
+** LLM Calls vs Agent Implementation
+
+- *Straight LLM calls* by themselves are NOT agent implementations
+- An agent requires: goals, decision-making, tool selection, state management
+- LLM is just one component in the agent architecture
+
+** Workflow-LLM Integration
+
+#+BEGIN_SRC mermaid
+flowchart LR
+    subgraph Workflow["Deterministic Workflow"]
+        S1[Step 1: Validate Input]
+        S2[Step 2: LLM Summarization]
+        S3[Step 3: Store Result]
+        S4[Step 4: Notify User]
+        S1 --> S2 --> S3 --> S4
+    end
+
+    subgraph LLMCalls["LLM Calls (Non-Deterministic)"]
+        L1[GPT-4 for Summarization]
+        L2[Claude for Classification]
+        L3[Local LLM for Validation]
+    end
+
+    S2 -.->|"Invoke"| L1
+
+    subgraph AIAgent["Triggering AI Agent"]
+        A1[Agent with<br/>Different Model]
+    end
+
+    A1 -->|"Triggers"| Workflow
+
+    Note1[Workflow LLM calls and<br/>Agent LLM can use different models]
+
+    style Workflow fill:#e8f5e9
+    style LLMCalls fill:#fff3e0
+    style AIAgent fill:#f3e5f5
+#+END_SRC
+
+** LLM Client Proxy Benefits
+
+#+BEGIN_SRC mermaid
+flowchart TB
+    subgraph Clients["Workflow/Agent Clients"]
+        C1[Workflow Step]
+        C2[AI Agent]
+        C3[Another Service]
+    end
+
+    subgraph Proxy["LLM Client Proxy"]
+        P1[Request Router]
+        P2[Cache Layer]
+        P3[Tracing/Logging]
+        P4[Cost Tracking]
+        P5[Rate Limiting]
+    end
+
+    subgraph LLMs["LLM Providers"]
+        L1[OpenAI]
+        L2[Anthropic]
+        L3[Local Models]
+    end
+
+    C1 --> P1
+    C2 --> P1
+    C3 --> P1
+
+    P1 --> P2
+    P2 --> P3
+    P3 --> P4
+    P4 --> P5
+
+    P5 --> L1
+    P5 --> L2
+    P5 --> L3
+
+    P2 -.->|"Cache Hit"| C1
+    P3 -.->|"Observability"| Logs[(Logs/Traces)]
+    P4 -.->|"Pricing Data"| Metrics[(Cost Metrics)]
+
+    style Proxy fill:#e1f5fe
+#+END_SRC
+
+* Synthesis: The Complete Architecture
+
+#+BEGIN_SRC mermaid
+flowchart TB
+    subgraph UserLayer["User/Client Layer"]
+        U1[User Request]
+        U2[Scheduled Trigger]
+        U3[Event Trigger]
+    end
+
+    subgraph AgentLayer["Durable AI Agent Layer"]
+        A1[Long-Lived Agent Process]
+        A2[Work Queue Monitor]
+        A3[Agent State Manager]
+    end
+
+    subgraph OrchestrationLayer["Workflow Orchestration Layer"]
+        W1[Workflow Engine]
+        W2[Step Executor]
+        W3[Checkpoint Manager]
+        W4[Approval Gate Handler]
+    end
+
+    subgraph ActivityLayer["Activity Layer"]
+        ACT1[LLM Activities]
+        ACT2[Tool Activities]
+        ACT3[External Service Activities]
+    end
+
+    subgraph PersistenceLayer["Durable Persistence Layer"]
+        DB1[(Workflow State)]
+        DB2[(Checkpoints)]
+        DB3[(Event History)]
+        DB4[(Approval Requests)]
+    end
+
+    subgraph InfraLayer["Infrastructure Layer"]
+        I1[LLM Proxy]
+        I2[Message Queue]
+        I3[Monitoring/Tracing]
+    end
+
+    U1 --> A2
+    U2 --> A2
+    U3 --> A2
+
+    A2 --> A1
+    A1 --> A3
+    A1 --> W1
+
+    W1 --> W2
+    W2 --> W3
+    W2 --> W4
+
+    W2 --> ACT1
+    W2 --> ACT2
+    W2 --> ACT3
+
+    ACT1 --> I1
+    ACT2 --> I2
+
+    W3 --> DB2
+    W1 --> DB1
+    ACT1 --> DB3
+    ACT2 --> DB3
+    ACT3 --> DB3
+    W4 --> DB4
+
+    A3 --> DB1
+
+    I1 --> I3
+    I2 --> I3
+
+    DB2 -.->|"Recovery"| W1
+    DB3 -.->|"Replay"| W2
+
+    style AgentLayer fill:#f3e5f5
+    style OrchestrationLayer fill:#e8f5e9
+    style ActivityLayer fill:#fff8e1
+    style PersistenceLayer fill:#e3f2fd
+    style InfraLayer fill:#fce4ec
+#+END_SRC
+
+* Key Takeaways
+
+1. *Separate deterministic from non-deterministic*: Wrap unpredictable AI decisions in predictable workflow boundaries
+
+2. *Persist everything*: Every LLM response, tool result, and decision must be saved for replay
+
+3. *Checkpoint comprehensively*: Capture full execution context, not just completion status
+
+4. *Design for failure*: Assume crashes will happen; make recovery the default path
+
+5. *Long-lived agents*: Transform ephemeral LLM calls into stateful, resilient processes
+
+* References
+
+** Durable Execution Frameworks
+- Temporal Durable Execution: https://docs.temporal.io/workflows
+- Temporal + AI Agents: https://temporal.io/blog/of-course-you-can-build-dynamic-ai-agents-with-temporal
+- Common Pitfalls with Durable Execution: https://medium.com/@cgillum/common-pitfalls-with-durable-execution-frameworks-like-durable-functions-or-temporal-eaf635d4a8bb
+
+** AI Agent Persistence
+- LangGraph Persistence System: https://deepwiki.com/langchain-ai/langgraph/4-persistence-system
+- Pydantic AI + Temporal: https://temporal.io/blog/build-durable-ai-agents-pydantic-ai-and-temporal
+- Microsoft Durable Multi-Agent Orchestration: https://techcommunity.microsoft.com/blog/appsonazureblog/building-durable-and-deterministic-multi-agent-orchestrations-with-durable-execu/4408842
+
+** Additional Resources
+- Temporal Learn Tutorials: https://learn.temporal.io/tutorials/
+- Databricks Stateful Agents: https://docs.databricks.com/aws/en/generative-ai/agent-framework/stateful-agents
+- Building LangGraph (Design Principles): https://blog.langchain.com/building-langgraph/
